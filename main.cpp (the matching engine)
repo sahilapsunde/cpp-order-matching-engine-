@@ -1,0 +1,114 @@
+#include "order_book.h"
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <vector>
+// 
+ Global order ID counter (atomic for thread safety) 
+std::atomic<long long> order_id_counter{1};
+// 
+ OrderBook implementation 
+OrderBook::OrderBook()
+    : buy_orders_([](const Order& a, const Order& b) {
+          if (a.price == b.price) return a.timestamp > b.timestamp;
+          return a.price < b.price;  // max-heap by price
+      }),
+      sell_orders_([](const Order& a, const Order& b) {
+          if (a.price == b.price) return a.timestamp > b.timestamp;
+          return a.price > b.price;  // min-heap by price
+      }) {}
+void OrderBook::addOrder(Order order) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    active_orders_[order.id] = order;
+    if (order.side == OrderSide::BUY) {
+        buy_orders_.push(order);
+    } else {
+        sell_orders_.push(order);
+    }
+}
+void OrderBook::cancelOrder(long long order_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    active_orders_.erase(order_id);
+    // Lazy deletion: orders removed during match() if not in active_orders_
+}
+std::vector<Trade> OrderBook::match() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<Trade> trades;
+    while (!buy_orders_.empty() && !sell_orders_.empty()) {
+        Order buy  = buy_orders_.top();
+        Order sell = sell_orders_.top();
+        // Skip cancelled orders (lazy deletion)
+        if (active_orders_.find(buy.id) == active_orders_.end()) {
+            buy_orders_.pop(); continue;
+        }
+        if (active_orders_.find(sell.id) == active_orders_.end()) {
+            sell_orders_.pop(); continue;
+        }
+        if (buy.price >= sell.price) {
+            int matched_qty = std::min(buy.quantity, sell.quantity);
+            double matched_price = sell.price;
+            trades.push_back({buy.id, sell.id, matched_price, matched_qty});
+            std::cout << "[TRADE] Buy#" << buy.id
+                      << " x Sell#" << sell.id
+                      << " @ " << matched_price
+                      << " qty=" << matched_qty << "\n";
+            buy_orders_.pop();
+            sell_orders_.pop();
+            active_orders_.erase(buy.id);
+            active_orders_.erase(sell.id);
+            // Partial fill: re-insert remainder
+            if (buy.quantity > matched_qty) {
+                Order rem = buy; rem.quantity -= matched_qty;
+                buy_orders_.push(rem);
+                active_orders_[rem.id] = rem;
+            }
+            if (sell.quantity > matched_qty) {
+                Order rem = sell; rem.quantity -= matched_qty;
+                sell_orders_.push(rem);
+                active_orders_[rem.id] = rem;
+            }
+        } else {
+            break; // No match possible at current prices
+        }
+    }
+    return trades;
+}
+// 
+ Main: simulate order flow 
+int main() {
+    OrderBook book;
+    auto now = []() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    };
+    auto make_order = [&](OrderSide side, double price, int qty) -> Order {
+        return Order{
+            order_id_counter.fetch_add(1),
+            side, OrderType::LIMIT,
+            price, qty, now()
+        };
+    };
+    // Simulate concurrent order submission
+    auto submit = [&](std::vector<Order> orders) {
+        for (auto& o : orders) {
+            book.addOrder(o);
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+    };
+    std::thread buyer_thread(submit, std::vector<Order>{
+        make_order(OrderSide::BUY, 101.5, 100),
+    });
+        make_order(OrderSide::BUY, 101.0, 200),
+        make_order(OrderSide::BUY, 100.5, 150),
+    std::thread seller_thread(submit, std::vector<Order>{
+        make_order(OrderSide::SELL, 101.0, 100),
+        make_order(OrderSide::SELL, 102.0, 200),
+        make_order(OrderSide::SELL, 100.5, 100),
+    });
+    buyer_thread.join();
+    seller_thread.join();
+    std::cout << "\n=== Running Matching Engine ===\n";
+    auto trades = book.match();
+    std::cout << "\nTotal trades executed: " << trades.size() << "\n";
+    return 0;
+}
